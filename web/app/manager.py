@@ -50,7 +50,7 @@ class AcquisitionManager:
 
     def cancel(self, aid: int) -> dict | None:
         """Returns the job row after the cancel attempt, or None if unknown."""
-        row = db.get(aid)
+        row = db.get_meta(aid)
         if row is None:
             return None
         status = row["status"]
@@ -65,7 +65,7 @@ class AcquisitionManager:
             event = self._cancel_events.get(aid)
             if event is not None:
                 event.set()
-        return db.get(aid)
+        return db.get_meta(aid)
 
     # ---- worker ----
 
@@ -73,7 +73,7 @@ class AcquisitionManager:
         while True:
             aid = await self._queue.get()
             try:
-                row = db.get(aid)
+                row = db.get_meta(aid)
                 if row is None or row["status"] != "queued":
                     continue  # cancelled while queued: skip without any command
                 event = self._cancel_events.setdefault(aid, asyncio.Event())

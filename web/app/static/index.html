@@ -76,11 +76,26 @@
   </div>
 </main>
 <div id="toast"></div>
+<script src="/static/refresh.js"></script>
 <script>
 const STATUS_TEXT = {
   queued: '排队中', running: '采集中', cancelling: '取消中',
   done: '完成', cancelled: '已取消', error: '错误'
 };
+// Window size. The default is the required "newest 50"; ?limit=N (1..200) is
+// a demo/testing affordance so a row leaving the window can be shown quickly.
+const PAGE_SIZE = (() => {
+  const raw = new URLSearchParams(location.search).get('limit');
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) ? Math.min(200, Math.max(1, n))
+                            : AcqRefresh.DEFAULT_PAGE_SIZE;
+})();
+// Holds the newest window (bounded), the server cursor and process epoch.
+const state = AcqRefresh.createState(PAGE_SIZE);
+// Only one poll in flight; extra triggers collapse into one follow-up poll.
+let inFlight = false;
+let refreshQueued = false;
+
 function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg; t.style.display = 'block';
@@ -104,14 +119,14 @@ async function acquire() {
       body: JSON.stringify({channel})
     });
     toast('已提交采集 #' + job.id);
-    refresh();
+    requestRefresh();
   } catch (e) { toast('提交失败: ' + e.message); }
 }
 async function cancel(id) {
   try {
     const job = await api('/api/acquisitions/' + id + '/cancel', {method: 'POST'});
     toast('采集 #' + id + '：' + (STATUS_TEXT[job.status] || job.status));
-    refresh();
+    requestRefresh();
   } catch (e) { toast('取消失败: ' + e.message); }
 }
 function fmt(v, digits) {
@@ -124,40 +139,124 @@ function fmtTime(ts) {
   return d.toLocaleTimeString('zh-CN', {hour12: false}) +
          '.' + String(d.getMilliseconds()).padStart(3, '0');
 }
-function render(jobs) {
-  const tbody = document.getElementById('rows');
-  if (!jobs.length) {
-    tbody.innerHTML = '<tr><td colspan="10">暂无采集记录</td></tr>';
-    return;
-  }
-  tbody.innerHTML = jobs.map(j => {
-    const st = j.status;
-    const canCancel = (st === 'queued' || st === 'running' || st === 'cancelling');
-    const canDownload = (st === 'done' && j.has_samples);
-    const ops = [];
-    if (canCancel)
-      ops.push(`<button class="link" onclick="cancel(${j.id})">取消</button>`);
-    if (canDownload)
-      ops.push(`<button class="link" onclick="location.href='/api/acquisitions/${j.id}/csv'">下载CSV</button>`);
-    return `<tr>
-      <td class="mono">${j.id}</td>
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+// Stable fingerprint of the fields that affect a rendered row (including the
+// fields behind the cancel / download buttons).
+function rowKey(j) {
+  return [j.status, j.error, j.sample_interval, j.volt_scale, j.volt_offset,
+          j.points, j.has_samples, j.created_at, j.channel].join('\u0001');
+}
+function rowHtml(j) {
+  const st = j.status;
+  const canCancel = (st === 'queued' || st === 'running' || st === 'cancelling');
+  const canDownload = (st === 'done' && j.has_samples);
+  const ops = [];
+  if (canCancel)
+    ops.push(`<button class="link" onclick="cancel(${j.id})">取消</button>`);
+  if (canDownload)
+    ops.push(`<button class="link" onclick="location.href='/api/acquisitions/${j.id}/csv'">下载CSV</button>`);
+  return `<td class="mono">${j.id}</td>
       <td>CHANnel${j.channel}</td>
-      <td><span class="badge st-${st}">${STATUS_TEXT[st] || st}</span></td>
+      <td><span class="badge st-${esc(st)}">${esc(STATUS_TEXT[st] || st)}</span></td>
       <td class="mono">${fmt(j.sample_interval)}</td>
       <td class="mono">${fmt(j.volt_scale)}</td>
       <td class="mono">${fmt(j.volt_offset)}</td>
       <td class="mono">${j.points ?? '—'}</td>
-      <td class="err" title="${j.error ? j.error.replace(/"/g, '&quot;') : ''}">${j.error || ''}</td>
+      <td class="err" title="${j.error ? esc(j.error) : ''}">${j.error ? esc(j.error) : ''}</td>
       <td class="mono">${fmtTime(j.created_at)}</td>
-      <td>${ops.join(' ')}</td>
-    </tr>`;
-  }).join('');
+      <td>${ops.join(' ')}</td>`;
 }
-async function refresh() {
+function ensureRow(j) {
+  let tr = document.getElementById('row-' + j.id);
+  if (!tr) {
+    tr = document.createElement('tr');
+    tr.id = 'row-' + j.id;
+    tr.dataset.key = '';
+  }
+  const key = rowKey(j);
+  if (tr.dataset.key !== key) {
+    tr.innerHTML = rowHtml(j);
+    tr.dataset.key = key;
+  }
+  return tr;
+}
+const tbody = () => document.getElementById('rows');
+function removeEmpty() {
+  const empty = document.getElementById('emptyRow');
+  if (empty) empty.remove();
+}
+function renderWindow() {
+  const body = tbody();
+  if (!state.order.length) {
+    if (!document.getElementById('emptyRow')) {
+      body.innerHTML = '<tr id="emptyRow"><td colspan="10">暂无采集记录</td></tr>';
+    }
+    for (const tr of Array.from(body.children)) {
+      if (tr.id !== 'emptyRow') tr.remove();
+    }
+    return;
+  }
+  removeEmpty();
+  // Reorder by appending in newest-first order. Existing nodes are moved, so
+  // untouched rows keep their rendered content (no re-render, no flicker).
+  for (const id of state.order) {
+    const job = state.jobs.get(id);
+    if (!job) continue;
+    body.appendChild(ensureRow(job));
+  }
+  const keep = new Set(state.order.map(id => 'row-' + id));
+  for (const tr of Array.from(body.children)) {
+    if (tr.id !== 'emptyRow' && !keep.has(tr.id)) tr.remove();
+  }
+}
+function renderResult(result) {
+  if (!result.applied) return;  // stale / foreign response: keep current view
+  if (result.full) {
+    tbody().innerHTML = '';
+    renderWindow();
+    return;
+  }
+  if (!result.changed.length && !result.removed.length) return;  // no changes
+  for (const id of result.changed) ensureRow(state.jobs.get(id));
+  for (const id of result.removed) {
+    const tr = document.getElementById('row-' + id);
+    if (tr) tr.remove();
+  }
+  renderWindow();
+}
+async function poll() {
+  if (inFlight) { refreshQueued = true; return; }
+  inFlight = true;
+  refreshQueued = false;
   try {
-    const jobs = await api('/api/acquisitions');
-    render(jobs);
-  } catch (e) { /* 暂时性失败，下个周期重试 */ }
+    // Always ask for a page sized to this view. When the cursor is unknown
+    // or the server answers with a full page (?limit=N demo / restart), the
+    // window stays consistent with what the page displays.
+    const params = new URLSearchParams({limit: String(PAGE_SIZE)});
+    if (state.cursor !== null && state.epoch !== null) {
+      params.set('since', String(state.cursor));
+      params.set('epoch', state.epoch);
+    }
+    const data = await api('/api/acquisitions/changes?' + params.toString());
+    renderResult(AcqRefresh.apply(state, data));
+  } catch (e) {
+    /* transient failure: keep the cursor and retry next tick */
+  } finally {
+    inFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      poll();
+    }
+  }
+}
+// Trigger an immediate poll after a user action (submit/cancel).
+function requestRefresh() {
+  if (inFlight) { refreshQueued = true; return; }
+  poll();
 }
 async function loadHealth() {
   try {
@@ -167,8 +266,8 @@ async function loadHealth() {
   } catch (e) {}
 }
 loadHealth();
-refresh();
-setInterval(refresh, 1000);
+poll();
+setInterval(poll, 1000);
 </script>
 </body>
 </html>

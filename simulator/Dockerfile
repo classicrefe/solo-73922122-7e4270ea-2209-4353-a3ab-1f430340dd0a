@@ -10,3 +10,6 @@ ENV SIM_HOST=0.0.0.0 \
 
 EXPOSE 5025
 CMD ["python", "scpi_simulator.py"]
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
+  CMD python -c "import socket; socket.create_connection(('127.0.0.1', 5025), 2).close()"

@@ -4,12 +4,20 @@ services:
     ports:
       - "5025:5025"
     environment:
-      SIM_WAVEFORM: sine        # sine | square | ramp | noise
-      SIM_SEGMENT: "1024"       # bytes per TCP segment when sending the block
-      SIM_SEGMENT_DELAY: "0"    # seconds between segments
-      SIM_TAIL_DELAY: "0"       # extra delay before the last segment
-      SIM_DROP_AFTER: "0"       # drop connection after N block bytes (0 = off)
-      SIM_RESPONSE_DELAY: "0"   # delay before every query response
+      # All values can be overridden from the host shell, e.g.
+      #   SIM_SEGMENT_DELAY=0.3 docker compose up --build
+      SIM_WAVEFORM: "${SIM_WAVEFORM:-sine}"           # sine | square | ramp | noise
+      SIM_SEGMENT: "${SIM_SEGMENT:-1024}"            # bytes per TCP segment
+      SIM_SEGMENT_DELAY: "${SIM_SEGMENT_DELAY:-0}"   # seconds between segments
+      SIM_TAIL_DELAY: "${SIM_TAIL_DELAY:-0}"         # extra delay before last segment
+      SIM_DROP_AFTER: "${SIM_DROP_AFTER:-0}"         # drop after N block bytes (0=off)
+      SIM_RESPONSE_DELAY: "${SIM_RESPONSE_DELAY:-0}" # delay before every response
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5025), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
 
   web:
     build: ./web
@@ -20,10 +28,21 @@ services:
       SCOPE_PORT: "5025"
       SCOPE_TIMEOUT: "5"        # per-round timeout in seconds
       DB_PATH: /data/acquisitions.db
+      # Fixed upper bound on the server-side refresh history. An older client
+      # cursor than this falls back to a full page instead of a delta.
+      REFRESH_HISTORY_CAP: "1000"
     volumes:
       - webdata:/data
     depends_on:
-      - simulator
+      simulator:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
 volumes:
   webdata:
