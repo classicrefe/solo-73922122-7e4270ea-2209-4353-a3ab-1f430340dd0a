@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>示波器波形采集</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f4f6f8; color: #222; }
+  header { background: #1f3a5f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { font-size: 12px; opacity: .8; margin-top: 4px; }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px 20px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px; }
+  .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  select, button { font-size: 14px; padding: 8px 14px; border-radius: 6px;
+                   border: 1px solid #c8d0d8; background: #fff; cursor: pointer; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:disabled { background: #9db8e0; border-color: #9db8e0; cursor: default; }
+  button.danger { background: #d64545; border-color: #d64545; color: #fff; }
+  button.link { border: none; background: none; color: #1f6feb; padding: 2px 6px; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #e6eaee;
+           white-space: nowrap; }
+  th { color: #667; font-weight: 600; background: #fafbfc; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; }
+  .st-queued     { background: #e8eaed; color: #555; }
+  .st-running    { background: #dbeafe; color: #1d4ed8; }
+  .st-cancelling { background: #ffedd5; color: #c2410c; }
+  .st-done       { background: #dcfce7; color: #15803d; }
+  .st-cancelled  { background: #e8eaed; color: #777; }
+  .st-error      { background: #fee2e2; color: #b91c1c; }
+  .err { color: #b91c1c; font-size: 12px; max-width: 220px; overflow: hidden;
+         text-overflow: ellipsis; }
+  #toast { position: fixed; top: 14px; right: 14px; background: #333; color: #fff;
+           padding: 10px 16px; border-radius: 6px; font-size: 13px; display: none; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>示波器波形采集</h1>
+  <div class="sub" id="scopeInfo">SCPI/TCP 仪器：连接信息加载中…</div>
+</header>
+<main>
+  <div class="card">
+    <div class="controls">
+      <label>通道：
+        <select id="channel">
+          <option value="1">CHANnel1</option>
+          <option value="2">CHANnel2</option>
+        </select>
+      </label>
+      <button class="primary" id="acquireBtn" onclick="acquire()">开始采集</button>
+      <span style="color:#889;font-size:12px">
+        每次冻结捕获 4096 点（16 位有符号、小端），完成后可下载电压-时间 CSV。
+      </span>
+    </div>
+  </div>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>通道</th><th>状态</th><th>采样间隔 (s)</th>
+          <th>电压比例 (V/LSB)</th><th>偏移 (V)</th><th>点数</th>
+          <th>错误</th><th>创建时间</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="rows"><tr><td colspan="10">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</main>
+<div id="toast"></div>
+<script>
+const STATUS_TEXT = {
+  queued: '排队中', running: '采集中', cancelling: '取消中',
+  done: '完成', cancelled: '已取消', error: '错误'
+};
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let detail = r.status;
+    try { detail = (await r.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+async function acquire() {
+  const channel = parseInt(document.getElementById('channel').value, 10);
+  try {
+    const job = await api('/api/acquisitions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({channel})
+    });
+    toast('已提交采集 #' + job.id);
+    refresh();
+  } catch (e) { toast('提交失败: ' + e.message); }
+}
+async function cancel(id) {
+  try {
+    const job = await api('/api/acquisitions/' + id + '/cancel', {method: 'POST'});
+    toast('采集 #' + id + '：' + (STATUS_TEXT[job.status] || job.status));
+    refresh();
+  } catch (e) { toast('取消失败: ' + e.message); }
+}
+function fmt(v, digits) {
+  if (v === null || v === undefined) return '—';
+  return Number(v).toExponential(digits === undefined ? 3 : digits);
+}
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('zh-CN', {hour12: false}) +
+         '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+function render(jobs) {
+  const tbody = document.getElementById('rows');
+  if (!jobs.length) {
+    tbody.innerHTML = '<tr><td colspan="10">暂无采集记录</td></tr>';
+    return;
+  }
+  tbody.innerHTML = jobs.map(j => {
+    const st = j.status;
+    const canCancel = (st === 'queued' || st === 'running' || st === 'cancelling');
+    const canDownload = (st === 'done' && j.has_samples);
+    const ops = [];
+    if (canCancel)
+      ops.push(`<button class="link" onclick="cancel(${j.id})">取消</button>`);
+    if (canDownload)
+      ops.push(`<button class="link" onclick="location.href='/api/acquisitions/${j.id}/csv'">下载CSV</button>`);
+    return `<tr>
+      <td class="mono">${j.id}</td>
+      <td>CHANnel${j.channel}</td>
+      <td><span class="badge st-${st}">${STATUS_TEXT[st] || st}</span></td>
+      <td class="mono">${fmt(j.sample_interval)}</td>
+      <td class="mono">${fmt(j.volt_scale)}</td>
+      <td class="mono">${fmt(j.volt_offset)}</td>
+      <td class="mono">${j.points ?? '—'}</td>
+      <td class="err" title="${j.error ? j.error.replace(/"/g, '&quot;') : ''}">${j.error || ''}</td>
+      <td class="mono">${fmtTime(j.created_at)}</td>
+      <td>${ops.join(' ')}</td>
+    </tr>`;
+  }).join('');
+}
+async function refresh() {
+  try {
+    const jobs = await api('/api/acquisitions');
+    render(jobs);
+  } catch (e) { /* 暂时性失败，下个周期重试 */ }
+}
+async function loadHealth() {
+  try {
+    const h = await api('/api/health');
+    document.getElementById('scopeInfo').textContent =
+      `SCPI/TCP 仪器：${h.scope}　单轮超时：${h.round_timeout_s}s`;
+  } catch (e) {}
+}
+loadHealth();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

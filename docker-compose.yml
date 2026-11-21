@@ -1,0 +1,29 @@
+services:
+  simulator:
+    build: ./simulator
+    ports:
+      - "5025:5025"
+    environment:
+      SIM_WAVEFORM: sine        # sine | square | ramp | noise
+      SIM_SEGMENT: "1024"       # bytes per TCP segment when sending the block
+      SIM_SEGMENT_DELAY: "0"    # seconds between segments
+      SIM_TAIL_DELAY: "0"       # extra delay before the last segment
+      SIM_DROP_AFTER: "0"       # drop connection after N block bytes (0 = off)
+      SIM_RESPONSE_DELAY: "0"   # delay before every query response
+
+  web:
+    build: ./web
+    ports:
+      - "8000:8000"
+    environment:
+      SCOPE_HOST: simulator
+      SCOPE_PORT: "5025"
+      SCOPE_TIMEOUT: "5"        # per-round timeout in seconds
+      DB_PATH: /data/acquisitions.db
+    volumes:
+      - webdata:/data
+    depends_on:
+      - simulator
+
+volumes:
+  webdata:
